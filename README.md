@@ -13,3 +13,5 @@ Or download `Zen EPUB Reader.html` and double-click it.
 - Books and reading positions are stored only in your own browser; nothing is uploaded
 
 DRM-protected books are not supported.
+
+MIT licensed — fork it, change it, share it.
