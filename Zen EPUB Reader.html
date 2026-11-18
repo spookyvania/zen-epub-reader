@@ -44,15 +44,15 @@
   #ui-menu button, #ui-menu span { display: block; width: 100%; padding: 0 1ch; white-space: pre-wrap; }
   #ui-menu span, .dim { color: var(--dim); }
 
-  #ui-home, #ui-scroller { flex: 1; min-height: 0; overflow-y: auto; }
+  #ui-home { flex: 1; min-height: 0; overflow-y: auto; }
+  #ui-scroller { flex: 1; min-height: 0; overflow: hidden; padding: 2em 2ch; outline: none; }
   #ui-home { padding: 2em 1ch; }
   #ui-home > * { max-width: 68ch; margin: 0 auto; }
   #ui-library { list-style: none; padding: 0; }
   #ui-library li { display: flex; }
   #ui-library li > button:first-child { flex: 1; min-width: 0; }
   #ui-error { color: #c0564a; min-height: 1.5em; }
-  #ui-page { max-width: 68ch; margin: 0 auto; padding: 2em 1ch 6em; font-size: var(--fs); }
-  #ui-next2 { margin-top: 3em; font-size: 13px; color: var(--dim); }
+  #ui-content { height: 100%; max-width: 68ch; margin: 0 auto; font-size: var(--fs); }
   body.dragging::after {
     content: "drop to open"; position: fixed; inset: 0; z-index: 9;
     border: 1px dashed var(--fg); background: var(--bg); display: grid; place-items: center;
@@ -77,10 +77,7 @@
 </section>
 
 <main id="ui-scroller" hidden tabindex="-1">
-  <div id="ui-page">
-    <div id="ui-content"></div>
-    <button id="ui-next2">next →</button>
-  </div>
+  <div id="ui-content"></div>
 </main>
 
 <script>
@@ -101,9 +98,8 @@ document.documentElement.dataset.theme = theme;
 const FS_MIN = 10, FS_MAX = 40;
 let fontSize = store.get('fontSize', 16);
 function applyFontSize(keepPlace) {
-  const f = keepPlace ? scrollFrac() : 0;
   document.documentElement.style.setProperty('--fs', fontSize + 'px');
-  if (keepPlace) setScrollFrac(f);
+  if (keepPlace) relayout();
 }
 function changeFontSize(d) {
   fontSize = Math.min(FS_MAX, Math.max(FS_MIN, fontSize + d));
@@ -125,13 +121,14 @@ function readZip(buf) {
   for (let n = 0; n < count && dv.getUint32(p, true) === 0x02014b50; n++) {
     const nl = dv.getUint16(p + 28, true), el = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
     const name = td.decode(u8.subarray(p + 46, p + 46 + nl));
-    files.set(name, { method: dv.getUint16(p + 10, true), csize: dv.getUint32(p + 20, true), off: dv.getUint32(p + 42, true) });
+    files.set(name, { method: dv.getUint16(p + 10, true), csize: dv.getUint32(p + 20, true), size: dv.getUint32(p + 24, true), off: dv.getUint32(p + 42, true) });
     lower.set(name.toLowerCase(), name);
     p += 46 + nl + el + cl;
   }
   const find = name => files.get(name) || files.get(lower.get(name.toLowerCase()));
   return {
     has: name => !!find(name),
+    size: name => find(name)?.size || 0,
     async bytes(name) {
       const f = find(name);
       if (!f) throw new Error('missing file in epub: ' + name);
@@ -218,7 +215,12 @@ async function parseBook(buf, fileName) {
 
   const title = meta('title') || fileName.replace(/\.epub$/i, '');
   const urls = new Map();
+  // Section weights (by file size) so overall progress reflects length, not section count.
+  const sizes = spine.map(p => zip.size(p) || 1), before = [];
+  let total = 0;
+  for (const s of sizes) { before.push(total); total += s; }
   return {
+    sizes, before, total,
     id: meta('identifier') || title + ':' + buf.byteLength,
     title, author: meta('creator'), spine, toc, text,
     async url(path) {
@@ -281,13 +283,15 @@ let book = null, cur = 0, activeToc = -1;
 const scroller = $('scroller');
 const shadow = $('content').attachShadow({ mode: 'open' });
 shadow.innerHTML = `<style>
-  article { font-size: var(--fs); line-height: 1.6; overflow-wrap: break-word; }
+  :host { display: block; }
+  article { height: 100%; overflow: hidden; column-fill: auto; column-gap: 48px; line-height: 1.6; overflow-wrap: break-word; orphans: 2; widows: 2; }
+  article > :first-child { margin-top: 0; }
   ::selection { background: var(--fg); color: var(--bg); }
   p { margin: 0 0 1.6em; }
-  h1, h2, h3, h4, h5, h6 { font-size: 1em; font-weight: bold; margin: 3.2em 0 1.6em; }
+  h1, h2, h3, h4, h5, h6 { font-size: 1em; font-weight: bold; margin: 3.2em 0 1.6em; break-after: avoid; }
   h1, h2 { text-transform: uppercase; letter-spacing: .08em; }
   h1:first-child, h2:first-child { margin-top: 0; }
-  img, svg { max-width: 100%; height: auto; }
+  img, svg { max-width: 100%; max-height: var(--ph, 100%); height: auto; object-fit: contain; break-inside: avoid; }
   a { color: inherit; text-underline-offset: 3px; }
   blockquote { margin: 0 0 1.6em; padding-left: 2ch; border-left: 1px solid var(--dim); color: var(--dim); }
   pre { white-space: pre-wrap; }
@@ -298,8 +302,36 @@ shadow.innerHTML = `<style>
 </style><article></article>`;
 const article = shadow.querySelector('article');
 
-const scrollFrac = () => { const m = scroller.scrollHeight - scroller.clientHeight; return m > 0 ? scroller.scrollTop / m : 0; };
-const setScrollFrac = f => { scroller.scrollTop = f * (scroller.scrollHeight - scroller.clientHeight); };
+/* Pagination: the section is laid out in CSS columns, each exactly one window-sized page wide. */
+const GAP = 48;
+let page = 0, pages = 1, pageW = 0;
+function layout() {
+  pageW = $('content').clientWidth;
+  article.style.width = article.style.columnWidth = pageW + 'px';
+  article.style.setProperty('--ph', article.clientHeight + 'px');
+  pages = Math.max(1, Math.round((article.scrollWidth + GAP) / (pageW + GAP)));
+}
+function goPage(n) {
+  page = Math.min(pages - 1, Math.max(0, n));
+  article.scrollLeft = page * (pageW + GAP);
+  updateProgress();
+}
+function relayout() {
+  if (!book) return;
+  const f = page / pages;
+  layout();
+  goPage(Math.round(f * pages));
+}
+function turn(d) {
+  if (!book) return;
+  const n = page + d;
+  if (n >= pages) { if (cur < book.spine.length - 1) showChapter(cur + 1); }
+  else if (n < 0) { if (cur > 0) showChapter(cur - 1, { last: true }); }
+  else goPage(n);
+}
+const pageOf = el => Math.floor((el.getBoundingClientRect().left - article.getBoundingClientRect().left + article.scrollLeft) / (pageW + GAP));
+addEventListener('resize', relayout);
+article.addEventListener('load', relayout, true); // images change the page count once loaded
 
 function showError(err) { console.error(err); $('error').textContent = '! ' + (err?.message || String(err)).toLowerCase(); }
 
@@ -367,28 +399,35 @@ async function showChapter(i, opt = {}) {
   for (const n of [...body.childNodes]) frag.append(document.importNode(n, true));
   article.replaceChildren(frag);
 
+  article.scrollLeft = 0;
+  layout();
   const target = opt.frag && shadow.getElementById(opt.frag);
-  if (target) target.scrollIntoView(); else { scroller.scrollTop = 0; if (opt.frac) setScrollFrac(opt.frac); }
-  scroller.focus({ preventScroll: true });
-
-  $('next2').hidden = i === book.spine.length - 1;
   activeToc = -1;
   book.toc.forEach((t, n) => { if (t.index <= i) activeToc = n; });
-  updateProgress();
+  goPage(target ? pageOf(target) : opt.last ? pages - 1 : Math.round((opt.frac || 0) * pages));
+  scroller.focus({ preventScroll: true });
 }
 
 function updateProgress() {
   if (!book) return;
-  const f = scrollFrac(), p = (cur + f) / book.spine.length;
-  $('progress').textContent = `${cur + 1}/${book.spine.length} ${Math.round(p * 100)}%`;
+  const p = (book.before[cur] + (page + 1) / pages * book.sizes[cur]) / book.total;
+  $('progress').textContent = `${page + 1}/${pages} ${Math.round(p * 100)}%`;
   $('bar').style.width = p * 100 + '%';
-  store.set('pos:' + book.id, { i: cur, f, p });
+  store.set('pos:' + book.id, { i: cur, f: page / pages, p });
 }
-let ticking = false;
-scroller.addEventListener('scroll', () => {
-  if (ticking) return; ticking = true;
-  requestAnimationFrame(() => { ticking = false; updateProgress(); });
-}, { passive: true });
+
+// Turn pages with the wheel, or by clicking: left third goes back, the rest goes forward.
+let wheelAt = 0;
+scroller.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (Math.abs(e.deltaY) < 4 || Date.now() - wheelAt < 200) return;
+  wheelAt = Date.now();
+  turn(e.deltaY > 0 ? 1 : -1);
+}, { passive: false });
+scroller.addEventListener('click', e => {
+  if (e.composedPath().some(n => n.localName === 'a') || String(getSelection())) return;
+  turn(e.clientX < innerWidth / 3 ? -1 : 1);
+});
 
 shadow.addEventListener('click', e => {
   const a = e.target.closest?.('a[data-path]');
@@ -396,11 +435,8 @@ shadow.addEventListener('click', e => {
   e.preventDefault();
   const idx = book.spine.indexOf(a.getAttribute('data-path'));
   if (idx < 0) return;
-  const frag = a.getAttribute('data-frag');
-  if (idx === cur && frag) shadow.getElementById(frag)?.scrollIntoView();
-  else showChapter(idx, { frag });
+  showChapter(idx, { frag: a.getAttribute('data-frag') });
 });
-$('next2').onclick = () => showChapter(cur + 1);
 
 /* ---------- menu ---------- */
 // Each menu returns rows of [label, action, stayOpen]; a row with no action is a plain label.
@@ -466,8 +502,10 @@ addEventListener('keydown', e => {
   else if (e.key === '+' || e.key === '=') changeFontSize(1);
   else if (e.key === '-') changeFontSize(-1);
   else if (!book) return;
-  else if (e.key === 'ArrowRight' && cur < book.spine.length - 1) showChapter(cur + 1);
-  else if (e.key === 'ArrowLeft' && cur > 0) showChapter(cur - 1);
+  else if (['ArrowRight', 'ArrowDown', 'PageDown'].includes(e.key) || (e.key === ' ' && !e.shiftKey)) turn(1);
+  else if (['ArrowLeft', 'ArrowUp', 'PageUp'].includes(e.key) || e.key === ' ') turn(-1);
+  else return;
+  e.preventDefault();
 });
 
 /* ---------- opening files ---------- */
