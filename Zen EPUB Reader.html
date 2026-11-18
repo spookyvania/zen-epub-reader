@@ -424,8 +424,9 @@ scroller.addEventListener('wheel', e => {
   wheelAt = Date.now();
   turn(e.deltaY > 0 ? 1 : -1);
 }, { passive: false });
+let clickTurn = store.get('clickTurn', true);
 scroller.addEventListener('click', e => {
-  if (e.composedPath().some(n => n.localName === 'a') || String(getSelection())) return;
+  if (!clickTurn ||e.composedPath().some(n => n.localName === 'a') || String(getSelection())) return;
   turn(e.clientX < innerWidth / 3 ? -1 : 1);
 });
 
@@ -445,6 +446,7 @@ const menus = {
     book && ['contents ›', () => openMenu('contents'), true],
     ['text size ›', () => openMenu('size'), true],
     ['theme ›', () => openMenu('theme'), true],
+    ['click to turn ›', () => openMenu('click'), true],
     book && ['library', goHome],
     ['open file…', () => $('file').click()],
   ],
@@ -456,6 +458,7 @@ const menus = {
     ['+ larger', () => changeFontSize(1), true],
   ],
   theme: () => ['light', 'dark'].map(t => [(t === theme ? '* ' : '  ') + t, () => setTheme(t), true]),
+  click: () => [true, false].map(v => [(v === clickTurn ? '* ' : '  ') + (v ? 'on' : 'off'), () => { clickTurn = v; store.set('clickTurn', v); }, true]),
 };
 let menuName = null;
 function openMenu(name, focusIndex) {
